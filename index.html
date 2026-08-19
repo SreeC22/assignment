@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Receipt Check — verify freshness claims before you trust them</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--line:#2d333b;--ink:#e6edf3;--dim:#8b949e;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--link:#58a6ff;--mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--sans:-apple-system,'Segoe UI',Roboto,Arial,sans-serif}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.55;padding:40px 16px 80px}
+.wrap{max-width:720px;margin:0 auto}
+h1{font-family:var(--mono);font-size:22px;margin-bottom:6px}
+.sub{color:var(--dim);font-size:14px;margin-bottom:6px;max-width:620px}
+.byline{font-family:var(--mono);font-size:11px;color:var(--dim);margin-bottom:26px}
+label{display:block;font-family:var(--mono);font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:1px;margin:14px 0 6px}
+input{width:100%;background:var(--panel);border:1px solid var(--line);border-radius:8px;color:var(--ink);font-family:var(--mono);font-size:14px;padding:11px 12px}
+input:focus{outline:none;border-color:var(--link)}
+button{margin-top:16px;width:100%;background:#1f6feb;border:none;border-radius:8px;color:#fff;font-family:var(--mono);font-size:14px;font-weight:700;padding:12px;cursor:pointer}
+button:disabled{opacity:.5;cursor:wait}
+.hint{font-size:12px;color:var(--dim);margin-top:8px}
+.receipt{display:none;margin-top:24px;background:#0a0d12;border:1px solid var(--line);border-radius:10px;padding:16px 18px;font-family:var(--mono);font-size:13px}
+.receipt.show{display:block}
+.rhead{display:flex;justify-content:space-between;align-items:center;border-bottom:1px dashed var(--line);padding-bottom:10px;margin-bottom:10px}
+.rtitle{font-size:11px;text-transform:uppercase;letter-spacing:1.5px;color:var(--dim)}
+.badge{font-size:11px;font-weight:700;padding:3px 10px;border-radius:4px}
+.b-ok{background:#12261a;color:var(--ok);border:1px solid #1f4a2c}
+.b-warn{background:#2b230f;color:var(--warn);border:1px solid #5c4a1a}
+.b-bad{background:#2d1517;color:var(--bad);border:1px solid #5c2326}
+.rrow{display:flex;justify-content:space-between;gap:16px;padding:4px 0;flex-wrap:wrap}
+.rrow span:first-child{color:var(--dim)}
+.rrow span:last-child{text-align:right;word-break:break-all}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
+.verdict{margin-top:10px;padding-top:10px;border-top:1px dashed var(--line);font-weight:700}
+.foot{margin-top:32px;color:var(--dim);font-size:12px;font-family:var(--mono);border-top:1px solid var(--line);padding-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Receipt Check</h1>
+  <p class="sub">ChatGPT's job-scan agent told me a role was "posted August 4, verified live." The canonical record said December 2025. This is the verification step it skipped, running for real: paste any Lever, Ashby, or Greenhouse posting URL plus the date the agent claimed, and get a receipt straight from the job board's own record.</p>
+  <p class="byline">Prototype by Sree Chityala · the working slice of the "verification receipts" fix proposed for ChatGPT Scheduled Tasks · runs entirely in your browser against the boards' public APIs · <a href="mock.html">see the in-ChatGPT UI mock →</a></p>
+
+  <label for="url">Job posting URL (jobs.lever.co / jobs.ashbyhq.com / greenhouse.io)</label>
+  <input id="url" placeholder="https://jobs.lever.co/company/posting-id" autocomplete="off">
+  <label for="claimed">Claimed posting date (what the agent asserted)</label>
+  <input id="claimed" placeholder="2026-08-04" autocomplete="off">
+  <button id="go" onclick="check()">Run the check the agent skipped</button>
+  <p class="hint">Leave the claimed date empty to just fetch the canonical posting date and true age.</p>
+
+  <div class="receipt" id="rc">
+    <div class="rhead"><span class="rtitle">Verification receipt · freshness</span><span class="badge" id="badge"></span></div>
+    <div id="rows"></div>
+    <div class="verdict" id="verdict"></div>
+  </div>
+
+  <p class="foot">How it works: the page detects the ATS from the URL and fetches the board's own public record (Lever createdAt, Ashby publishedAt, Greenhouse first_published), then compares it to the claimed date with a 7-day tolerance. Match → VERIFIED with source and timestamp. Mismatch → CONFLICT: the claim is not asserted, and in the proposed ChatGPT integration the recommendation is held for the user. Fetch impossible → honest UNVERIFIED, never fake confidence. A companion UI mock shows how these receipts render inside a ChatGPT scan card.</p>
+</div>
+<script>
+function row(k,v,cls){return '<div class="rrow"><span>'+k+'</span><span class="'+(cls||'')+'">'+v+'</span></div>';}
+function fmt(ms){return new Date(ms).toISOString().slice(0,10);}
+async function resolve(url){
+  const u=new URL(url); const host=u.hostname; const parts=u.pathname.split('/').filter(Boolean);
+  if(host.includes('jobs.lever.co')){
+    const [company,id]=parts;
+    if(!company||!id) throw new Error('Lever URL should look like jobs.lever.co/company/posting-id');
+    const from='https://api.lever.co/v0/postings/'+company+'/'+id;
+    const r=await fetch(from);
+    if(!r.ok) throw new Error('Lever posting API returned '+r.status+' (posting may have been taken down - itself a signal)');
+    const j=await r.json();
+    return {canonical:new Date(j.createdAt).getTime(), field:'createdAt', source:'Lever posting API (canonical)', from, title:j.text};
+  }
+  if(host.includes('ashbyhq.com')){
+    const [org,jobId]=parts;
+    if(!org||!jobId) throw new Error('Ashby URL should look like jobs.ashbyhq.com/org/job-id');
+    const from='https://api.ashbyhq.com/posting-api/job-board/'+org;
+    const r=await fetch(from);
+    if(!r.ok) throw new Error('Ashby posting API returned '+r.status);
+    const j=await r.json();
+    const job=(j.jobs||[]).find(x=>x.id===jobId||(x.jobUrl||'').includes(jobId)||(x.applyUrl||'').includes(jobId));
+    if(!job) throw new Error('Job not on the live Ashby board - likely closed or unlisted (itself a signal)');
+    return {canonical:new Date(job.publishedAt).getTime(), field:'publishedAt', source:'Ashby posting API (canonical)', from, title:job.title};
+  }
+  if(host.includes('greenhouse.io')){
+    const company=parts[0]; const ji=parts.indexOf('jobs');
+    const id=ji>=0?parts[ji+1]:(u.searchParams.get('gh_jid')||parts[parts.length-1]);
+    if(!company||!id) throw new Error('Greenhouse URL should look like boards.greenhouse.io/company/jobs/id');
+    const from='https://boards-api.greenhouse.io/v1/boards/'+company+'/jobs/'+id;
+    const r=await fetch(from);
+    if(!r.ok) throw new Error('Greenhouse boards API returned '+r.status);
+    const j=await r.json();
+    const iso=j.first_published||j.updated_at;
+    return {canonical:new Date(iso).getTime(), field:j.first_published?'first_published':'updated_at (first_published unavailable)', source:'Greenhouse boards API (canonical)', from, title:j.title};
+  }
+  throw new Error('Unsupported board. Paste a jobs.lever.co, jobs.ashbyhq.com, or greenhouse.io posting URL.');
+}
+async function check(){
+  const btn=document.getElementById('go'); btn.disabled=true; btn.textContent='Fetching canonical source...';
+  const url=document.getElementById('url').value.trim();
+  const claimed=document.getElementById('claimed').value.trim();
+  const rc=document.getElementById('rc'), badge=document.getElementById('badge'), rows=document.getElementById('rows'), verdict=document.getElementById('verdict');
+  rc.classList.add('show');
+  try{
+    const d=await resolve(url);
+    const checkedAt=new Date().toISOString();
+    const ageDays=Math.round((Date.now()-d.canonical)/86400000);
+    let deltaDays=null, conflict=false;
+    if(claimed){
+      const c=new Date(claimed);
+      if(isNaN(c)) throw new Error('Could not parse the claimed date. Use a format like 2026-08-04.');
+      deltaDays=Math.round((c.getTime()-d.canonical)/86400000);
+      conflict=Math.abs(deltaDays)>7;
+    }
+    if(conflict){
+      badge.className='badge b-bad'; badge.textContent='CONFLICT';
+      rows.innerHTML=row('posting', d.title||'-')
+        +row('claimed date', claimed, 'bad')
+        +row('canonical '+d.field, fmt(d.canonical), 'bad')
+        +row('gap', Math.abs(deltaDays)+' days', 'bad')
+        +row('true age today', ageDays+' days')
+        +row('source', d.source)+row('fetched', d.from)+row('checked at', checkedAt);
+      verdict.innerHTML='<span class="bad">&#10007; Sources conflict &rarr; claim is NOT asserted; recommendation held for user decision</span>';
+    } else {
+      badge.className='badge b-ok'; badge.textContent='VERIFIED';
+      rows.innerHTML=row('posting', d.title||'-')
+        +(claimed?row('claimed date', claimed, 'ok'):'')
+        +row('canonical '+d.field, fmt(d.canonical), 'ok')
+        +(claimed?row('gap', Math.abs(deltaDays)+' days (within 7-day tolerance)', 'ok'):'')
+        +row('true age today', ageDays+' days')
+        +row('source', d.source)+row('fetched', d.from)+row('checked at', checkedAt);
+      verdict.innerHTML='<span class="ok">&#10003; Claim earns the word "verified" &mdash; receipt attached</span>';
+    }
+  }catch(e){
+    badge.className='badge b-warn'; badge.textContent='UNVERIFIED';
+    rows.innerHTML=row('what happened', String(e.message||e), 'warn')+row('checked at', new Date().toISOString());
+    verdict.innerHTML='<span class="warn">&#9651; Could not verify &rarr; in the proposed fix the claim ships labeled unverified, never as "verified"</span>';
+  }
+  btn.disabled=false; btn.textContent='Run the check the agent skipped';
+}
+</script>
+</body>
+</html>
